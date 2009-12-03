@@ -1,3 +1,8 @@
+/*
+  bzipindex.c: Generates a block index for a bzip2 file. bunzip implementation
+  from Rob Landley's micro-bunzip, somewhat modified.
+*/
+
 /*	micro-bunzip, a small, simple bzip2 decompression implementation.
 	Copyright 2003 by Rob Landley (rob@landley.net).
 
@@ -14,7 +19,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
+#include <stdint.h>
+
+typedef uint64_t filepos_t;
 
 /* Constants for huffman coding */
 #define MAX_GROUPS			6
@@ -66,6 +73,8 @@ typedef struct {
     /* State for interrupting output loop */
     int writePos,writeRun,writeCount,writeCurrent;
 
+    filepos_t uncomp_pos, comp_pos;
+
     /* These things are a bit too big to go on the stack */
     unsigned char selectors[32768];			/* nSelectors=15 bits */
     struct group_data groups[MAX_GROUPS];	/* huffman coding tables */
@@ -74,6 +83,7 @@ typedef struct {
 /* Return the next nnn bits of input.  All reads from the compressed input
    are done through this function.  All reads are big endian */
 static unsigned int get_bits(bunzip_data *bd, char bits_wanted) {
+    const int wanted = bits_wanted;
     unsigned int bits=0;
 
     /* If we need to get more data from the byte buffer, do so.  (Loop getting
@@ -100,6 +110,7 @@ static unsigned int get_bits(bunzip_data *bd, char bits_wanted) {
     bd->inbufBitCount-=bits_wanted;
     bits|=(bd->inbufBits>>bd->inbufBitCount)&((1<<bits_wanted)-1);
 
+    bd->comp_pos += wanted;
     return bits;
 }
 
@@ -111,6 +122,8 @@ extern int read_bunzip_data(bunzip_data *bd) {
         i,j,k,t,runPos,symCount,symTotal,nSelectors,byteCount[256];
     unsigned char uc, symToByte[256], mtfSymbol[256], *selectors;
     unsigned int *dbuf;
+
+    fprintf(stderr, "Starting a block at comp bitpos %lld, uncomp bitpos %lld\n", bd->comp_pos, bd->uncomp_pos);
 
     /* Read in header signature (borrowing mtfSymbol for temp space). */
     for(i=0;i<6;i++) mtfSymbol[i]=get_bits(bd,8);
@@ -364,7 +377,7 @@ extern void flush_bunzip_outbuf(bunzip_data *bd, int out_fd) {
 /* Undo burrows-wheeler transform on intermediate buffer to produce output.
    If !len, write up to len bytes of data to buf.  Otherwise write to out_fd.
    Returns len ? bytes written : RETVAL_OK.  Notice all errors negative #'s. */
-extern int write_bunzip_data(bunzip_data *bd, int out_fd, char *outbuf, int len) {
+extern int write_bunzip_data(bunzip_data *bd, int out_fd) {
     unsigned int *dbuf=bd->dbuf;
     int count,pos,current, run,copies,outbyte,previous,gotcount=0;
 
@@ -387,9 +400,6 @@ extern int write_bunzip_data(bunzip_data *bd, int out_fd, char *outbuf, int len)
         current=bd->writeCurrent;
         run=bd->writeRun;
         while(count) {
-            /* If somebody (like busybox tar) wants a certain number of bytes of
-               data from memory instead of written to a file, humor them */
-            if(len && bd->outbufPos>=len) goto dataus_interruptus;
             count--;
             /* Follow sequence vector to undo Burrows-Wheeler transform */
             previous=current;
@@ -412,6 +422,7 @@ extern int write_bunzip_data(bunzip_data *bd, int out_fd, char *outbuf, int len)
                 bd->outbuf[bd->outbufPos++] = outbyte;
                 bd->dataCRC = (bd->dataCRC << 8)
                     ^ bd->crc32Table[(bd->dataCRC >> 24) ^ outbyte];
+                bd->uncomp_pos += 8;
             }
             if(current!=previous) run=0;
         }
@@ -423,45 +434,24 @@ extern int write_bunzip_data(bunzip_data *bd, int out_fd, char *outbuf, int len)
             bd->totalCRC=bd->headerCRC+1;
             return RETVAL_LAST_BLOCK;
         }
-    dataus_interruptus:
         bd->writeCount=count;
-        if(len) {
-            gotcount+=bd->outbufPos;
-            memcpy(outbuf,bd->outbuf,len);
-            /* If we got enough data, checkpoint loop state and return */
-            if((len-=bd->outbufPos)<1) {
-                bd->outbufPos-=len;
-                if(bd->outbufPos)
-                    memmove(bd->outbuf,bd->outbuf+len,bd->outbufPos);
-                bd->writePos=pos;
-                bd->writeCurrent=current;
-                bd->writeRun=run;
-                return gotcount;
-            }
-        }
     }
 }
 
 /* Allocate the structure, read file header.  If !len, src_fd contains
    filehandle to read from.  Else inbuf contains data. */
-extern int start_bunzip(bunzip_data **bdp, int src_fd, char *inbuf, int len) {
+extern int start_bunzip(bunzip_data **bdp, int src_fd) {
     bunzip_data *bd;
     unsigned int i,j,c;
 
     /* Figure out how much data to allocate */
-    i=sizeof(bunzip_data);
-    if(!len) i+=IOBUF_SIZE;
+    i = sizeof(bunzip_data) + IOBUF_SIZE;
     /* Allocate bunzip_data.  Most fields initialize to zero. */
     if(!(bd=*bdp=malloc(i))) return RETVAL_OUT_OF_MEMORY;
     memset(bd,0,sizeof(bunzip_data));
-    if(len) {
-        bd->inbuf=inbuf;
-        bd->inbufCount=len;
-        bd->in_fd=-1;
-    } else {
-        bd->inbuf=(char *)(bd+1);
-        bd->in_fd=src_fd;
-    }
+    bd->inbuf=(char *)(bd+1);
+    bd->in_fd=src_fd;
+
     /* Init the CRC32 table (big endian) */
     for(i=0;i<256;i++) {
         c=i<<24;
@@ -477,6 +467,7 @@ extern int start_bunzip(bunzip_data **bdp, int src_fd, char *inbuf, int len) {
     /* Next byte ascii '1'-'9', indicates block size in units of 100k of
        uncompressed data.  Allocate intermediate buffer for block. */
     i=get_bits(bd,8);
+    fprintf(stderr, "Mode is %d\n", i-'0');
     if (i<'1' || i>'9') return RETVAL_NOT_BZIP_DATA;
     bd->dbufSize=100000*(i-'0');
     if(!(bd->dbuf=malloc(bd->dbufSize * sizeof(int))))
@@ -489,9 +480,8 @@ extern int start_bunzip(bunzip_data **bdp, int src_fd, char *inbuf, int len) {
 extern char *uncompressStream(int src_fd, int dst_fd) {
     bunzip_data *bd;
     int i;
-
-    if(!(i=start_bunzip(&bd,src_fd,0,0))) {
-        i=write_bunzip_data(bd,dst_fd,0,0);
+    if(!(i=start_bunzip(&bd,src_fd))) {
+        i=write_bunzip_data(bd,dst_fd);
         if(i==RETVAL_LAST_BLOCK && bd->headerCRC==bd->totalCRC) i=RETVAL_OK;
     }
     flush_bunzip_outbuf(bd,dst_fd);

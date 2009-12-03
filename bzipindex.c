@@ -21,7 +21,7 @@
 #include <string.h>
 #include <stdint.h>
 
-typedef uint64_t filepos_t;
+typedef off_t filepos_t;
 
 /* Constants for huffman coding */
 #define MAX_GROUPS			6
@@ -59,13 +59,12 @@ struct group_data {
 typedef struct {
     /* For I/O error handling */
     jmp_buf jmpbuf;
+
     /* Input stream, input buffer, input bit buffer */
-    int in_fd,inbufCount,inbufPos;
+    FILE* in_file;
+    int inbufCount,inbufPos;
     unsigned char *inbuf;
     unsigned int inbufBitCount, inbufBits;
-    /* Output buffer */
-    char outbuf[IOBUF_SIZE];
-    int outbufPos;
     /* The CRC values stored in the block header and calculated from the data */
     unsigned int crc32Table[256],headerCRC, dataCRC, totalCRC;
     /* Intermediate buffer and its size (in bytes) */
@@ -73,7 +72,10 @@ typedef struct {
     /* State for interrupting output loop */
     int writePos,writeRun,writeCount,writeCurrent;
 
-    filepos_t uncomp_pos, comp_pos;
+    FILE* idx_file;
+    filepos_t idx_next_pos;
+    uint64_t uncomp_pos, comp_pos;
+    unsigned int idxitems;
 
     /* These things are a bit too big to go on the stack */
     unsigned char selectors[32768];			/* nSelectors=15 bits */
@@ -91,7 +93,7 @@ static unsigned int get_bits(bunzip_data *bd, char bits_wanted) {
     while (bd->inbufBitCount<bits_wanted) {
         /* If we need to read more data from file into byte buffer, do so */
         if(bd->inbufPos==bd->inbufCount) {
-            if(!(bd->inbufCount = read(bd->in_fd, bd->inbuf, IOBUF_SIZE)))
+            if(!(bd->inbufCount = fread(bd->inbuf, 1, IOBUF_SIZE, bd->in_file)))
                 longjmp(bd->jmpbuf,RETVAL_UNEXPECTED_INPUT_EOF);
             bd->inbufPos=0;
         }
@@ -114,16 +116,44 @@ static unsigned int get_bits(bunzip_data *bd, char bits_wanted) {
     return bits;
 }
 
+static void write64(bunzip_data* bd, uint64_t d){
+    
+    filepos_t oldpos = ftello(bd->in_file);
+    if (oldpos == -1){
+        perror("tell");
+    }
+    
+    if (fseeko(bd->idx_file, bd->idx_next_pos, SEEK_SET) <0){
+        perror("seek");
+    }
+
+    unsigned char x[8];
+    int i;
+    for (i=0;i<8;i++){
+        x[7-i] = d & 0xff;
+        d >>= 8;
+    }
+    fwrite(x, 8, 1, bd->idx_file);
+    bd->idx_next_pos = ftello(bd->idx_file);
+    
+    if (fseeko(bd->in_file, oldpos, SEEK_SET) <0){
+        perror("seek");
+    }
+
+    bd->idxitems++;
+}
+
 /* Decompress a block of text to into intermediate buffer */
 
-extern int read_bunzip_data(bunzip_data *bd) {
+static int read_bunzip_data(bunzip_data *bd) {
     struct group_data *hufGroup;
     int dbufCount,nextSym,dbufSize,origPtr,groupCount,*base,*limit,selector,
         i,j,k,t,runPos,symCount,symTotal,nSelectors,byteCount[256];
     unsigned char uc, symToByte[256], mtfSymbol[256], *selectors;
     unsigned int *dbuf;
 
-    fprintf(stderr, "Starting a block at comp bitpos %lld, uncomp bitpos %lld\n", bd->comp_pos, bd->uncomp_pos);
+    write64(bd, bd->comp_pos);
+    write64(bd, bd->uncomp_pos);
 
     /* Read in header signature (borrowing mtfSymbol for temp space). */
     for(i=0;i<6;i++) mtfSymbol[i]=get_bits(bd,8);
@@ -364,20 +394,10 @@ extern int read_bunzip_data(bunzip_data *bd) {
     return RETVAL_OK;
 }
 
-/* Flush output buffer to disk */
-extern void flush_bunzip_outbuf(bunzip_data *bd, int out_fd) {
-    if(bd->outbufPos) {
-        if(write(out_fd, bd->outbuf, bd->outbufPos) != bd->outbufPos)
-            longjmp(bd->jmpbuf,RETVAL_UNEXPECTED_OUTPUT_EOF);
-        bd->outbufPos=0;
-    }
-}
-
-
 /* Undo burrows-wheeler transform on intermediate buffer to produce output.
    If !len, write up to len bytes of data to buf.  Otherwise write to out_fd.
    Returns len ? bytes written : RETVAL_OK.  Notice all errors negative #'s. */
-extern int write_bunzip_data(bunzip_data *bd, int out_fd) {
+static int write_bunzip_data(bunzip_data *bd) {
     unsigned int *dbuf=bd->dbuf;
     int count,pos,current, run,copies,outbyte,previous,gotcount=0;
 
@@ -416,10 +436,7 @@ extern int write_bunzip_data(bunzip_data *bd, int out_fd) {
                 copies=1;
                 outbyte=current;
             }
-            /* Output bytes to buffer, flushing to file if necessary */
             while(copies--) {
-                if(bd->outbufPos == IOBUF_SIZE) flush_bunzip_outbuf(bd,out_fd);
-                bd->outbuf[bd->outbufPos++] = outbyte;
                 bd->dataCRC = (bd->dataCRC << 8)
                     ^ bd->crc32Table[(bd->dataCRC >> 24) ^ outbyte];
                 bd->uncomp_pos += 8;
@@ -440,17 +457,27 @@ extern int write_bunzip_data(bunzip_data *bd, int out_fd) {
 
 /* Allocate the structure, read file header.  If !len, src_fd contains
    filehandle to read from.  Else inbuf contains data. */
-extern int start_bunzip(bunzip_data **bdp, int src_fd) {
+static int build_index(FILE* src_fd, FILE* idx_fd) {
     bunzip_data *bd;
-    unsigned int i,j,c;
+    unsigned int i,j,c,err;
 
     /* Figure out how much data to allocate */
     i = sizeof(bunzip_data) + IOBUF_SIZE;
     /* Allocate bunzip_data.  Most fields initialize to zero. */
-    if(!(bd=*bdp=malloc(i))) return RETVAL_OUT_OF_MEMORY;
+    if(!(bd=malloc(i))){
+        err = RETVAL_OUT_OF_MEMORY;
+        goto out;
+    }
     memset(bd,0,sizeof(bunzip_data));
     bd->inbuf=(char *)(bd+1);
-    bd->in_fd=src_fd;
+    bd->in_file=src_fd;
+    bd->idx_file=idx_fd;
+
+    filepos_t oldpos = ftello(src_fd);
+    fseeko(idx_fd, 0, SEEK_END);
+    fprintf(idx_fd, "BZIX____");
+    bd->idx_next_pos = ftello(idx_fd);
+    fseeko(src_fd, oldpos, SEEK_SET);
 
     /* Init the CRC32 table (big endian) */
     for(i=0;i<256;i++) {
@@ -461,37 +488,62 @@ extern int start_bunzip(bunzip_data **bdp, int src_fd) {
     }
     /* Setup for I/O error handling via longjmp */
     i=setjmp(bd->jmpbuf);
-    if(i) return i;
+    if(i){
+        err = i; 
+        goto out; 
+    }
     /* Ensure that file starts with "BZh" */
-    for(i=0;i<3;i++) if(get_bits(bd,8)!="BZh"[i]) return RETVAL_NOT_BZIP_DATA;
+    for(i=0;i<3;i++){
+        if(get_bits(bd,8)!="BZh"[i]){ 
+            err = RETVAL_NOT_BZIP_DATA;
+            goto out;
+        }
+    }
     /* Next byte ascii '1'-'9', indicates block size in units of 100k of
        uncompressed data.  Allocate intermediate buffer for block. */
     i=get_bits(bd,8);
-    fprintf(stderr, "Mode is %d\n", i-'0');
-    if (i<'1' || i>'9') return RETVAL_NOT_BZIP_DATA;
+    if (i<'1' || i>'9'){ err=RETVAL_NOT_BZIP_DATA; goto out; }
     bd->dbufSize=100000*(i-'0');
-    if(!(bd->dbuf=malloc(bd->dbufSize * sizeof(int))))
-        return RETVAL_OUT_OF_MEMORY;
-    return RETVAL_OK;
+    if(!(bd->dbuf=malloc(bd->dbufSize * sizeof(int)))){
+        err = RETVAL_OUT_OF_MEMORY;
+        goto out;
+    }
+     
+
+    err=write_bunzip_data(bd);
+    if (err==RETVAL_LAST_BLOCK && bd->headerCRC==bd->totalCRC){
+        err = RETVAL_OK;
+    }
+    if (err) goto out;
+        
+    unsigned int idxbytes_i = bd->idxitems * 8 + 16;
+    unsigned int tmp = idxbytes_i;
+    unsigned char idxbytes[4];
+    for (i=0;i<4;i++){
+        idxbytes[3-i] = tmp&0xff;
+        tmp >>= 8;
+    }
+    fseeko(idx_fd, bd->idx_next_pos, SEEK_SET);
+    fprintf(idx_fd, "BZIX");
+    fwrite(idxbytes, 4, 1, idx_fd);
+    fseeko(idx_fd, -idxbytes_i + 4, SEEK_CUR);
+    fwrite(idxbytes, 4, 1, idx_fd);
+    err=RETVAL_OK;
+    goto out;
+
+
+
+ out:
+    if (bd->dbuf) free(bd->dbuf);
+    free(bd);
+    return err;
 }
 
-/* Example usage: decompress src_fd to dst_fd.  (Stops at end of bzip data,
-   not end of file.) */
-extern char *uncompressStream(int src_fd, int dst_fd) {
-    bunzip_data *bd;
-    int i;
-    if(!(i=start_bunzip(&bd,src_fd))) {
-        i=write_bunzip_data(bd,dst_fd);
-        if(i==RETVAL_LAST_BLOCK && bd->headerCRC==bd->totalCRC) i=RETVAL_OK;
-    }
-    flush_bunzip_outbuf(bd,dst_fd);
-    if(bd->dbuf) free(bd->dbuf);
-    free(bd);
-    return bunzip_errors[-i];
-}
 
 /* Dumb little test thing, decompress stdin to stdout */
 int main(int argc, char *argv[]) {
-    char *c=uncompressStream(0,1);
-    fprintf(stderr,"\n%s\n", c ? c : "Completed OK");
+    int err = build_index(stdin, fopen("index", "w"));
+    if (err){
+        fprintf(stderr, "Error: %s\n", bunzip_errors[-err]);
+    }
 }

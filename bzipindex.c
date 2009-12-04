@@ -21,8 +21,6 @@
 #include <string.h>
 #include <stdint.h>
 
-typedef off_t filepos_t;
-
 /* Constants for huffman coding */
 #define MAX_GROUPS			6
 #define GROUP_SIZE   		50		/* 64 would have been more efficient */
@@ -73,7 +71,7 @@ typedef struct {
     int writePos,writeRun,writeCount,writeCurrent;
 
     FILE* idx_file;
-    filepos_t idx_next_pos;
+    off_t idx_next_pos;
     uint64_t uncomp_pos, comp_pos;
     unsigned int idxitems;
 
@@ -118,7 +116,7 @@ static unsigned int get_bits(bunzip_data *bd, char bits_wanted) {
 
 static void write64(bunzip_data* bd, uint64_t d){
     
-    filepos_t oldpos = ftello(bd->in_file);
+    off_t oldpos = ftello(bd->in_file);
     if (oldpos == -1){
         perror("tell");
     }
@@ -473,7 +471,7 @@ static int build_index(FILE* src_fd, FILE* idx_fd) {
     bd->in_file=src_fd;
     bd->idx_file=idx_fd;
 
-    filepos_t oldpos = ftello(src_fd);
+    off_t oldpos = ftello(src_fd);
     fseeko(idx_fd, 0, SEEK_END);
     fprintf(idx_fd, "BZIX____");
     bd->idx_next_pos = ftello(idx_fd);

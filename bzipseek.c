@@ -72,7 +72,8 @@ static bzseek_err load_block(bzseek_file* f, uint64_t start, uint64_t end){
   }
 
 
-  assert(!memcmp(blk_header, "\x31\x41\x59\x26\x53\x59", 6));
+  if (memcmp(blk_header, "\x31\x41\x59\x26\x53\x59", 6))
+    return BZSEEK_BAD_DATA;
 
   memcpy(bit_data + nread, "\x17\x72\x45\x38\x50\x90", 6); 
   memcpy(bit_data + nread + 6, blk_header + 6, 4);

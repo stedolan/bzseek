@@ -129,8 +129,8 @@ bzseek_err run_bz(bzseek_file* f, int* count, int* len, char** buf){
   case BZ_MEM_ERROR:
     return BZSEEK_OUT_OF_MEM;
   case BZ_STREAM_END:
-    return BZSEEK_EOF;
   case BZ_OK:
+    /* end-of-stream is ok in this case, there may be following blocks */
     return BZSEEK_OK;
   default:
     assert(0);

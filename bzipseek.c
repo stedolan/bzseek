@@ -10,16 +10,37 @@
 
 #include <assert.h>
 
+#include <errno.h>
+
 #include "bzipseek.h"
 
-typedef uint64_t filepos_t;
+
+struct bzseek_file{
+  FILE* f_data;
+  FILE* f_idx;
+
+  int blocksz;
+
+  int idx_nitems;
+  uint64_t* idx_data;
+
+
+  char* buf;
+  int buflen, bufsize;
+  int curr_block;
+
+  bz_stream bz;
+};
+
+// Poor man's exceptions :D
+#define ATTEMPT(action) if ((err = action) != BZSEEK_OK) return err
 
 
 #define ROUND_UP_BYTES(nbits) (((nbits)+7)/8)
-static bzseek_err load_block(bzseek_file* f, filepos_t start, filepos_t end){
-  filepos_t startbyte = start / 8;
+static bzseek_err load_block(bzseek_file* f, uint64_t start, uint64_t end){
+  uint64_t startbyte = start / 8;
   int start_off = start % 8;
-  filepos_t nbits = end - start;
+  uint64_t nbits = end - start;
   int nbytes = ROUND_UP_BYTES(nbits);
   int nread = ROUND_UP_BYTES(end - startbyte * 8);
   int i;
@@ -111,7 +132,7 @@ static uint64_t get_bz_uncomp_pos(bzseek_file* f){
   return bzproduced + idx_uncomp_pos(f, f->curr_block);
 }
 
-bzseek_err run_bz(bzseek_file* f, int* count, int* len, char** buf){
+static bzseek_err run_bz(bzseek_file* f, int* count, int* len, char** buf){
   f->bz.next_out = *buf;
   f->bz.avail_out = *len;
   int oldlen = *len;
@@ -142,7 +163,7 @@ bzseek_err run_bz(bzseek_file* f, int* count, int* len, char** buf){
 
 
 
-bzseek_err seek_to_pos(bzseek_file* f, uint64_t pos){
+static bzseek_err seek_to_pos(bzseek_file* f, uint64_t pos){
   /* If we've already loaded the right block, do nothing */
   if (f->curr_block != -1 && 
       idx_uncomp_pos(f, f->curr_block) <= pos && 
@@ -163,12 +184,12 @@ bzseek_err seek_to_pos(bzseek_file* f, uint64_t pos){
   f->curr_block = i;
 
   bzseek_err err = BZSEEK_OK;
-  if (err=load_block(f, idx_comp_pos(f, i), idx_comp_pos(f, i+1))) return err;
-  if (err=init_bz(f)) return err;
+  ATTEMPT(load_block(f, idx_comp_pos(f, i), idx_comp_pos(f, i+1)));
+  ATTEMPT(init_bz(f));
   return BZSEEK_OK;
 }
 
-unsigned int parse_int32(unsigned char* x){
+static unsigned int parse_int32(unsigned char* x){
   int i;
   unsigned int n = 0;
   for (i=0; i<4; i++){
@@ -177,7 +198,7 @@ unsigned int parse_int32(unsigned char* x){
   return n;
 }
 
-uint64_t parse_int64(unsigned char* x){
+static uint64_t parse_int64(unsigned char* x){
   int i;
   uint64_t n = 0;
   for (i=0; i<8; i++){
@@ -186,7 +207,7 @@ uint64_t parse_int64(unsigned char* x){
   return n;
 }
 
-bzseek_err load_index(bzseek_file* f){
+static bzseek_err load_index(bzseek_file* f){
   int i;
   FILE* ix = f->f_idx;
   fseeko(ix, 0, SEEK_SET);
@@ -196,7 +217,7 @@ bzseek_err load_index(bzseek_file* f){
   if (!memcmp(header, "BZIX", 4)){
     size = (int)parse_int32(header + 4);
   }else{
-    /* search at end of file */
+    /* search at end of file for index header */
     fseeko(ix, -8, SEEK_SET);
     fread(header, 8, 1, ix);
     if (!memcmp(header, "BZIX", 4)){
@@ -233,6 +254,10 @@ bzseek_err load_index(bzseek_file* f){
 
 
 bzseek_err bzseek_open(bzseek_file* file, FILE* data_file, FILE* idx_file){
+  if (!data_file){
+    errno = EBADF;
+    return BZSEEK_IO_ERR;
+  }
   if (!idx_file) idx_file = data_file;
 
   memset(file, 0, sizeof(file));
@@ -244,6 +269,8 @@ bzseek_err bzseek_open(bzseek_file* file, FILE* data_file, FILE* idx_file){
   fseek(data_file, 0, SEEK_SET);
   char header[4] = {0};
   fread(header, 1, 4, data_file);
+  if (feof(data_file)) return BZSEEK_BAD_DATA;
+  if (ferror(data_file)) return BZSEEK_IO_ERR;
   if (memcmp(header, "BZh", 3))
     return BZSEEK_BAD_DATA;
   if (header[3] >= '0' && header[3] <= '9')
@@ -252,7 +279,7 @@ bzseek_err bzseek_open(bzseek_file* file, FILE* data_file, FILE* idx_file){
     return BZSEEK_BAD_DATA;
   
   bzseek_err err;
-  if (err=load_index(file)) return err;
+  ATTEMPT(load_index(file));
   
   return BZSEEK_OK;
 }
@@ -265,22 +292,22 @@ uint64_t bzseek_len(bzseek_file* file){
 
 #define NULL_BUF_SZ 1024
 bzseek_err bzseek_read(bzseek_file* file, uint64_t start, int len, char* buf){
-  uint64_t end = start + (uint64_t)len;
   bzseek_err err = BZSEEK_OK;
 
   /* loop in case the request spans multiple blocks */
   while (len > 0){
     /* load the correct block */
-    if (err = seek_to_pos(file, start)) return err;
+    ATTEMPT(seek_to_pos(file, start));
     assert(idx_uncomp_pos(file, file->curr_block) <= start && 
            start < idx_uncomp_pos(file, file->curr_block + 1));
 
     /* we may need to seek inside the block */
+
     uint64_t bzpos = get_bz_uncomp_pos(file);
 
     if (bzpos > start){
       /* we need to rewind to the start of the current block */
-      if (err = init_bz(file)) return err;
+      ATTEMPT(init_bz(file));
       bzpos = get_bz_uncomp_pos(file);
       assert(bzpos == idx_uncomp_pos(file, file->curr_block));
     }
@@ -297,7 +324,7 @@ bzseek_err bzseek_read(bzseek_file* file, uint64_t start, int len, char* buf){
         char* null_buf = devnull;
         int null_len = seek_forward > NULL_BUF_SZ ? NULL_BUF_SZ : seek_forward;
         int cnt;
-        if (err = run_bz(file, &cnt, &null_len, &null_buf)) return err;
+        ATTEMPT(run_bz(file, &cnt, &null_len, &null_buf));
         seek_forward -= cnt;
       }
       bzpos = get_bz_uncomp_pos(file);
@@ -306,7 +333,7 @@ bzseek_err bzseek_read(bzseek_file* file, uint64_t start, int len, char* buf){
     assert(bzpos == start);
     /* we're at the right place, do some decompression */
     int cnt;
-    if (err = run_bz(file, &cnt, &len, &buf)) return err;
+    ATTEMPT(run_bz(file, &cnt, &len, &buf));
     start += cnt;
   }
   return BZSEEK_OK;
@@ -344,11 +371,16 @@ int main(int argc, char* argv[]){
   //  load_index(&f);
   bzseek_open(&f, fopen("test3.bz2", "r"), fopen("index","r"));
   char x[100000];
-  bzseek_err err;
-  if (err = bzseek_read(&f, atoi(argv[1]), atoi(argv[2]), x)){
+  uint64_t start = atoi(argv[1]);
+  int len = atoi(argv[2]);
+  bzseek_err err = bzseek_read(&f, start, len, x);
+
+  if (err == BZSEEK_EOF){
+    len = bzseek_len(&f) - start;
+  }else if (err){
     printf("error: %s\n" , bzseek_errmsg(err));
   }
-  fwrite(x, 1, atoi(argv[2]), stdout);
+  fwrite(x, 1, len, stdout);
   bzseek_close(&f);
   return 0;
 }

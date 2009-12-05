@@ -21,6 +21,8 @@
 #include <string.h>
 #include <stdint.h>
 
+#include "bzipseek.h"
+
 /* Constants for huffman coding */
 #define MAX_GROUPS			6
 #define GROUP_SIZE   		50		/* 64 would have been more efficient */
@@ -30,14 +32,7 @@
 #define SYMBOL_RUNB			1
 
 /* Status return values */
-#define RETVAL_OK						0
 #define RETVAL_LAST_BLOCK				(-1)
-#define RETVAL_NOT_BZIP_DATA			(-2)
-#define RETVAL_UNEXPECTED_INPUT_EOF		(-3)
-#define RETVAL_UNEXPECTED_OUTPUT_EOF	(-4)
-#define RETVAL_DATA_ERROR				(-5)
-#define RETVAL_OUT_OF_MEMORY			(-6)
-#define RETVAL_OBSOLETE_INPUT			(-7)
 
 /* Other housekeeping constants */
 #define IOBUF_SIZE			4096
@@ -92,7 +87,7 @@ static unsigned int get_bits(bunzip_data *bd, char bits_wanted) {
         /* If we need to read more data from file into byte buffer, do so */
         if(bd->inbufPos==bd->inbufCount) {
             if(!(bd->inbufCount = fread(bd->inbuf, 1, IOBUF_SIZE, bd->in_file)))
-                longjmp(bd->jmpbuf,RETVAL_UNEXPECTED_INPUT_EOF);
+                longjmp(bd->jmpbuf,BZSEEK_EOF);
             bd->inbufPos=0;
         }
         /* Avoid 32-bit overflow (dump bit buffer to top of output) */
@@ -144,9 +139,9 @@ static void write64(bunzip_data* bd, uint64_t d){
 /* Decompress a block of text to into intermediate buffer */
 
 static int read_bunzip_data(bunzip_data *bd) {
-    struct group_data *hufGroup;
-    int dbufCount,nextSym,dbufSize,origPtr,groupCount,*base,*limit,selector,
-        i,j,k,t,runPos,symCount,symTotal,nSelectors,byteCount[256];
+    struct group_data *hufGroup=NULL;
+    int dbufCount,nextSym,dbufSize,origPtr,groupCount,*base=NULL,*limit=NULL,
+        selector,i,j,k,t,runPos,symCount,symTotal,nSelectors,byteCount[256];
     unsigned char uc, symToByte[256], mtfSymbol[256], *selectors;
     unsigned int *dbuf;
 
@@ -159,11 +154,11 @@ static int read_bunzip_data(bunzip_data *bd) {
     /* Read CRC (which is stored big endian). */
     bd->headerCRC=get_bits(bd,32);
     /* Is this the last block (with CRC for file)? */
-    if(!strcmp(mtfSymbol,"\x17\x72\x45\x38\x50\x90"))
+    if(!memcmp(mtfSymbol,"\x17\x72\x45\x38\x50\x90",6))
         return RETVAL_LAST_BLOCK;
     /* If it's not a valid data block, barf. */
-    if(strcmp(mtfSymbol,"\x31\x41\x59\x26\x53\x59"))
-        return RETVAL_NOT_BZIP_DATA;
+    if(memcmp(mtfSymbol,"\x31\x41\x59\x26\x53\x59",6))
+        return BZSEEK_BAD_DATA;
 
     dbuf=bd->dbuf;
     dbufSize=bd->dbufSize;
@@ -171,8 +166,8 @@ static int read_bunzip_data(bunzip_data *bd) {
     /* We can add support for blockRandomised if anybody complains.  There was
        some code for this in busybox 1.0.0-pre3, but nobody ever noticed that
        it didn't actually work. */
-    if(get_bits(bd,1)) return RETVAL_OBSOLETE_INPUT;
-    if((origPtr=get_bits(bd,24)) > dbufSize) return RETVAL_DATA_ERROR;
+    if(get_bits(bd,1)) return BZSEEK_BAD_DATA;
+    if((origPtr=get_bits(bd,24)) > dbufSize) return BZSEEK_BAD_DATA;
     /* mapping table: if some byte values are never used (encoding things
        like ascii text), the compression code removes the gaps to have fewer
        symbols to deal with, and writes a sparse bitfield indicating which
@@ -190,15 +185,15 @@ static int read_bunzip_data(bunzip_data *bd) {
     }
     /* How many different huffman coding groups does this block use? */
     groupCount=get_bits(bd,3);
-    if (groupCount<2 || groupCount>MAX_GROUPS) return RETVAL_DATA_ERROR;
+    if (groupCount<2 || groupCount>MAX_GROUPS) return BZSEEK_BAD_DATA;
     /* nSelectors: Every GROUP_SIZE many symbols we select a new huffman coding
        group.  Read in the group selector list, which is stored as MTF encoded
        bit runs. */
-    if(!(nSelectors=get_bits(bd, 15))) return RETVAL_DATA_ERROR;
+    if(!(nSelectors=get_bits(bd, 15))) return BZSEEK_BAD_DATA;
     for(i=0; i<groupCount; i++) mtfSymbol[i] = i;
     for(i=0; i<nSelectors; i++) {
         /* Get next value */
-        for(j=0;get_bits(bd,1);j++) if (j>=groupCount) return RETVAL_DATA_ERROR;
+        for(j=0;get_bits(bd,1);j++) if (j>=groupCount) return BZSEEK_BAD_DATA;
         /* Decode MTF to get the next selector */
         uc = mtfSymbol[j];
         memmove(mtfSymbol+1,mtfSymbol,j);
@@ -214,7 +209,7 @@ static int read_bunzip_data(bunzip_data *bd) {
         t=get_bits(bd, 5);
         for (i = 0; i < symCount; i++) {
             for(;;) {
-                if (t < 1 || t > MAX_HUFCODE_BITS) return RETVAL_DATA_ERROR;
+                if (t < 1 || t > MAX_HUFCODE_BITS) return BZSEEK_BAD_DATA;
                 if(!get_bits(bd, 1)) break;
                 if(!get_bits(bd, 1)) t++;
                 else t--;
@@ -283,7 +278,7 @@ static int read_bunzip_data(bunzip_data *bd) {
         /* Determine which huffman coding group to use. */
         if(!(symCount--)) {
             symCount=GROUP_SIZE-1;
-            if(selector>=nSelectors) return RETVAL_DATA_ERROR;
+            if(selector>=nSelectors) return BZSEEK_BAD_DATA;
             hufGroup=bd->groups+selectors[selector++];
             base=hufGroup->base-1;
             limit=hufGroup->limit-1;
@@ -292,7 +287,7 @@ static int read_bunzip_data(bunzip_data *bd) {
         i = hufGroup->minLen;
         j=get_bits(bd, i);
         for(;;) {
-            if (i > hufGroup->maxLen) return RETVAL_DATA_ERROR;
+            if (i > hufGroup->maxLen) return BZSEEK_BAD_DATA;
             if (j <= limit[i]) break;
             i++;
 
@@ -300,7 +295,7 @@ static int read_bunzip_data(bunzip_data *bd) {
         }
         /* Huffman decode nextSym (with bounds checking) */
         j-=base[i];
-        if (j < 0 || j >= MAX_SYMBOLS) return RETVAL_DATA_ERROR;
+        if (j < 0 || j >= MAX_SYMBOLS) return BZSEEK_BAD_DATA;
         nextSym = hufGroup->permute[j];
         /* If this is a repeated run, loop collecting data */
         if (nextSym == SYMBOL_RUNA || nextSym == SYMBOL_RUNB) {
@@ -327,7 +322,7 @@ static int read_bunzip_data(bunzip_data *bd) {
            literal used is the one at the head of the mtfSymbol array.) */
         if(runPos) {
             runPos=0;
-            if(dbufCount+t>=dbufSize) return RETVAL_DATA_ERROR;
+            if(dbufCount+t>=dbufSize) return BZSEEK_BAD_DATA;
 
             uc = symToByte[mtfSymbol[0]];
             byteCount[uc] += t;
@@ -341,7 +336,7 @@ static int read_bunzip_data(bunzip_data *bd) {
            result can't be -1 or 0, because 0 and 1 are RUNA and RUNB.
            Another instance of the first symbol in the mtf array, position 0,
            would have been handled as part of a run.) */
-        if(dbufCount>=dbufSize) return RETVAL_DATA_ERROR;
+        if(dbufCount>=dbufSize) return BZSEEK_BAD_DATA;
         i = nextSym - 1;
         uc = mtfSymbol[i];
         memmove(mtfSymbol+1,mtfSymbol,i);
@@ -358,7 +353,7 @@ static int read_bunzip_data(bunzip_data *bd) {
     */
 
     /* Now we know what dbufCount is, do a better sanity check on origPtr.  */
-    if (origPtr<0 || origPtr>=dbufCount) return RETVAL_DATA_ERROR;
+    if (origPtr<0 || origPtr>=dbufCount) return BZSEEK_BAD_DATA;
     /* Turn byteCount into cumulative occurrence counts of 0 to n-1. */
     j=0;
     for(i=0;i<256;i++) {
@@ -389,7 +384,7 @@ static int read_bunzip_data(bunzip_data *bd) {
     }
     bd->writeCount=dbufCount;
 
-    return RETVAL_OK;
+    return BZSEEK_OK;
 }
 
 /* Undo burrows-wheeler transform on intermediate buffer to produce output.
@@ -455,19 +450,20 @@ static int write_bunzip_data(bunzip_data *bd) {
 
 /* Allocate the structure, read file header.  If !len, src_fd contains
    filehandle to read from.  Else inbuf contains data. */
-static int build_index(FILE* src_fd, FILE* idx_fd) {
+bzseek_err bzseek_build_index(FILE* src_fd, FILE* idx_fd) {
     bunzip_data *bd;
-    unsigned int i,j,c,err;
+    unsigned int i,j,c;
+    bzseek_err err;
 
     /* Figure out how much data to allocate */
     i = sizeof(bunzip_data) + IOBUF_SIZE;
     /* Allocate bunzip_data.  Most fields initialize to zero. */
     if(!(bd=malloc(i))){
-        err = RETVAL_OUT_OF_MEMORY;
+        err = BZSEEK_OUT_OF_MEM;
         goto out;
     }
     memset(bd,0,sizeof(bunzip_data));
-    bd->inbuf=(char *)(bd+1);
+    bd->inbuf=(unsigned char *)(bd+1);
     bd->in_file=src_fd;
     bd->idx_file=idx_fd;
 
@@ -476,6 +472,10 @@ static int build_index(FILE* src_fd, FILE* idx_fd) {
     fprintf(idx_fd, "BZIX____");
     bd->idx_next_pos = ftello(idx_fd);
     fseeko(src_fd, oldpos, SEEK_SET);
+    if (ferror(idx_fd) || ferror(src_fd)){
+        err = BZSEEK_IO_ERR;
+        goto out;
+    }
 
     /* Init the CRC32 table (big endian) */
     for(i=0;i<256;i++) {
@@ -493,24 +493,24 @@ static int build_index(FILE* src_fd, FILE* idx_fd) {
     /* Ensure that file starts with "BZh" */
     for(i=0;i<3;i++){
         if(get_bits(bd,8)!="BZh"[i]){ 
-            err = RETVAL_NOT_BZIP_DATA;
+            err = BZSEEK_BAD_DATA;
             goto out;
         }
     }
     /* Next byte ascii '1'-'9', indicates block size in units of 100k of
        uncompressed data.  Allocate intermediate buffer for block. */
     i=get_bits(bd,8);
-    if (i<'1' || i>'9'){ err=RETVAL_NOT_BZIP_DATA; goto out; }
+    if (i<'1' || i>'9'){ err=BZSEEK_BAD_DATA; goto out; }
     bd->dbufSize=100000*(i-'0');
     if(!(bd->dbuf=malloc(bd->dbufSize * sizeof(int)))){
-        err = RETVAL_OUT_OF_MEMORY;
+        err = BZSEEK_OUT_OF_MEM;
         goto out;
     }
      
 
     err=write_bunzip_data(bd);
     if (err==RETVAL_LAST_BLOCK && bd->headerCRC==bd->totalCRC){
-        err = RETVAL_OK;
+        err = BZSEEK_OK;
     }
     if (err) goto out;
         
@@ -526,7 +526,7 @@ static int build_index(FILE* src_fd, FILE* idx_fd) {
     fwrite(idxbytes, 4, 1, idx_fd);
     fseeko(idx_fd, -idxbytes_i + 4, SEEK_CUR);
     fwrite(idxbytes, 4, 1, idx_fd);
-    err=RETVAL_OK;
+    err=BZSEEK_OK;
     goto out;
 
 
@@ -540,8 +540,9 @@ static int build_index(FILE* src_fd, FILE* idx_fd) {
 
 /* Dumb little test thing, decompress stdin to stdout */
 int main(int argc, char *argv[]) {
-    int err = build_index(stdin, fopen("index", "w"));
+    int err = bzseek_build_index(stdin, fopen("index", "w"));
     if (err){
         fprintf(stderr, "Error: %s\n", bunzip_errors[-err]);
     }
+    return 0;
 }

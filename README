@@ -1,0 +1,2 @@
+bzseek, a library for random-access into bzip2 compressed files.
+See bzipseek.h for what little documentation there is.

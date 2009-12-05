@@ -218,7 +218,7 @@ static bzseek_err load_index(bzseek_file* f){
     size = (int)parse_int32(header + 4);
   }else{
     /* search at end of file for index header */
-    fseeko(ix, -8, SEEK_SET);
+    fseeko(ix, -8, SEEK_END);
     fread(header, 8, 1, ix);
     if (!memcmp(header, "BZIX", 4)){
       size = (int)parse_int32(header + 4);
@@ -341,12 +341,12 @@ bzseek_err bzseek_read(bzseek_file* file, uint64_t start, int len, char* buf){
 
 
 void bzseek_close(bzseek_file* f){
-  free(f->buf);
-  f->buf = NULL;
-  fclose(f->f_data);
-  f->f_data = NULL;
-  fclose(f->f_idx);
-  f->f_idx = NULL;
+  if (f->f_idx == f->f_data) f->f_idx = NULL;
+
+  if (f->buf)    { free(f->buf);      f->buf    = NULL; }
+  if (f->f_data) { fclose(f->f_data); f->f_data = NULL; }
+  if (f->f_idx)  { fclose(f->f_idx);  f->f_idx  = NULL; }
+
   BZ2_bzDecompressEnd(&f->bz);
 }
 
@@ -369,11 +369,16 @@ int main(int argc, char* argv[]){
   bzseek_file f;
   //  f.f_data = f.f_idx = fopen("index","r");
   //  load_index(&f);
-  bzseek_open(&f, fopen("test3.bz2", "r"), fopen("index","r"));
+  bzseek_err err;
+  err = bzseek_open(&f, fopen("test4.bz2", "r"), NULL);
+  if (err){
+    printf("error opening: %s\n", bzseek_errmsg(err));
+    return 0;
+  }
   char x[100000];
   uint64_t start = atoi(argv[1]);
   int len = atoi(argv[2]);
-  bzseek_err err = bzseek_read(&f, start, len, x);
+  err = bzseek_read(&f, start, len, x);
 
   if (err == BZSEEK_EOF){
     len = bzseek_len(&f) - start;

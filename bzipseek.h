@@ -20,7 +20,7 @@ typedef enum{
    if idx_file is NULL, store the index directly in the bzip file.
    if this returns BZSEEK_EOF, it means that the bzip file ended
    sooner than expected and is probably corrupt. */
-bzseek_err bzseek_build_index(FILE* bzip_data, FILE* idx_file);
+bzseek_err bzseek_build_index(const char* src_name, const char* idx_name);
 
 
 

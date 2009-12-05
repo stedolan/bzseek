@@ -20,6 +20,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <errno.h>
+#include <unistd.h>
+#include <sys/types.h>
 
 #include "bzipseek.h"
 
@@ -448,12 +451,21 @@ static int write_bunzip_data(bunzip_data *bd) {
     }
 }
 
-/* Allocate the structure, read file header.  If !len, src_fd contains
-   filehandle to read from.  Else inbuf contains data. */
-bzseek_err bzseek_build_index(FILE* src_fd, FILE* idx_fd) {
+bzseek_err bzseek_build_index(const char* src_name, const char* idx_name) {
     bunzip_data *bd;
     unsigned int i,j,c;
     bzseek_err err;
+    FILE* src_fd;
+    FILE* idx_fd;
+    int add_index = idx_name == NULL;
+
+    if (idx_name){
+        src_fd = fopen(src_name, "r");
+        idx_fd = fopen(idx_name, "r+");
+    }else{
+        src_fd = idx_fd = fopen(src_name, "r+");
+    }
+
 
     /* Figure out how much data to allocate */
     i = sizeof(bunzip_data) + IOBUF_SIZE;
@@ -467,11 +479,52 @@ bzseek_err bzseek_build_index(FILE* src_fd, FILE* idx_fd) {
     bd->in_file=src_fd;
     bd->idx_file=idx_fd;
 
-    off_t oldpos = ftello(src_fd);
-    fseeko(idx_fd, 0, SEEK_END);
+    /* Try and detect an existing index so that we can overwrite it */
+    char buf[8];
+    fseeko(idx_fd, 0, SEEK_SET);
+    fread(buf, 1, 8, idx_fd);
+    if (!feof(idx_fd) && !memcmp(buf, "BZIX", 4)){
+        /* index found, at the start */
+        fseeko(idx_fd, 0, SEEK_SET);
+    }else{
+        clearerr(idx_fd);
+        if (fseeko(idx_fd, -8, SEEK_END) < 0){
+            /* no index found, write to start of file */
+            clearerr(idx_fd);
+            fseeko(idx_fd, 0, SEEK_SET);
+        }else{
+            if (fread(buf, 1, 8, idx_fd) == 8 && 
+                !feof(idx_fd) && 
+                !memcmp(buf, "BZIX", 4)){
+                /* index found, at the end */
+                unsigned int n = 0;
+                for (i=0; i<4; i++){
+                    n = (n << 8) + buf[4+i];
+                }
+                fseeko(idx_fd, -n, SEEK_END);
+                /* delete the old index */
+                if (ftruncate(fileno(idx_fd), ftello(idx_fd)) < 0){
+                    err = BZSEEK_IO_ERR;
+                    goto out;
+                }
+            }else{
+                /* no index found, yet file is non-empty */
+                /* only continue if we're supposed to add an index */
+                if (add_index){
+                    clearerr(idx_fd);
+                    fseeko(idx_fd, 0, SEEK_END);
+                }else{
+                    errno = EEXIST;
+                    err = BZSEEK_IO_ERR;
+                    goto out;
+                }
+            }
+        }
+    }
+
     fprintf(idx_fd, "BZIX____");
     bd->idx_next_pos = ftello(idx_fd);
-    fseeko(src_fd, oldpos, SEEK_SET);
+    fseeko(src_fd, 0, SEEK_SET);
     if (ferror(idx_fd) || ferror(src_fd)){
         err = BZSEEK_IO_ERR;
         goto out;
@@ -521,18 +574,25 @@ bzseek_err bzseek_build_index(FILE* src_fd, FILE* idx_fd) {
         idxbytes[3-i] = tmp&0xff;
         tmp >>= 8;
     }
-    fseeko(idx_fd, bd->idx_next_pos, SEEK_SET);
+    if (fseeko(idx_fd, bd->idx_next_pos, SEEK_SET) < 0){
+        err = BZSEEK_IO_ERR; goto out;
+    }
     fprintf(idx_fd, "BZIX");
     fwrite(idxbytes, 4, 1, idx_fd);
-    fseeko(idx_fd, -idxbytes_i + 4, SEEK_CUR);
+    if (fseeko(idx_fd, -idxbytes_i + 4, SEEK_CUR) < 0){
+        err = BZSEEK_IO_ERR; goto out;
+    }
     fwrite(idxbytes, 4, 1, idx_fd);
+
+    if (ferror(idx_fd)){ err = BZSEEK_IO_ERR; goto out; }
+
     err=BZSEEK_OK;
     goto out;
 
 
 
  out:
-    if (bd->dbuf) free(bd->dbuf);
+    if (bd && bd->dbuf) free(bd->dbuf);
     free(bd);
     return err;
 }
@@ -540,7 +600,7 @@ bzseek_err bzseek_build_index(FILE* src_fd, FILE* idx_fd) {
 
 /* Dumb little test thing, decompress stdin to stdout */
 int main(int argc, char *argv[]) {
-    int err = bzseek_build_index(stdin, fopen("index", "w"));
+    int err = bzseek_build_index(argv[1], NULL);
     if (err){
         fprintf(stderr, "Error: %s\n", bunzip_errors[-err]);
     }

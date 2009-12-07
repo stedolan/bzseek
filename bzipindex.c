@@ -24,7 +24,7 @@
 #include <unistd.h>
 #include <sys/types.h>
 
-#include "bzipseek.h"
+#include "bzseek.h"
 
 /* Constants for huffman coding */
 #define MAX_GROUPS			6
@@ -461,9 +461,12 @@ bzseek_err bzseek_build_index(const char* src_name, const char* idx_name) {
 
     if (idx_name){
         src_fd = fopen(src_name, "r");
+        if (!src_fd) return BZSEEK_IO_ERR;
         idx_fd = fopen(idx_name, "r+");
+        if (!idx_fd) return BZSEEK_IO_ERR;
     }else{
         src_fd = idx_fd = fopen(src_name, "r+");
+        if (!idx_fd) return BZSEEK_IO_ERR;
     }
 
 
@@ -595,14 +598,4 @@ bzseek_err bzseek_build_index(const char* src_name, const char* idx_name) {
     if (bd && bd->dbuf) free(bd->dbuf);
     free(bd);
     return err;
-}
-
-
-/* Dumb little test thing, decompress stdin to stdout */
-int main(int argc, char *argv[]) {
-    int err = bzseek_build_index(argv[1], NULL);
-    if (err){
-        fprintf(stderr, "Error: %s\n", bunzip_errors[-err]);
-    }
-    return 0;
 }

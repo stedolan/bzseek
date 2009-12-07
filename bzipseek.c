@@ -12,25 +12,10 @@
 
 #include <errno.h>
 
-#include "bzipseek.h"
+#include "bzseek.h"
 
 
-struct bzseek_file{
-  FILE* f_data;
-  FILE* f_idx;
 
-  int blocksz;
-
-  int idx_nitems;
-  uint64_t* idx_data;
-
-
-  char* buf;
-  int buflen, bufsize;
-  int curr_block;
-
-  bz_stream bz;
-};
 
 // Poor man's exceptions :D
 #define ATTEMPT(action) if ((err = action) != BZSEEK_OK) return err
@@ -71,7 +56,7 @@ static bzseek_err load_block(bzseek_file* f, uint64_t start, uint64_t end){
       (bit_data[i+1] >> (8-start_off));
   }
 
-
+  /* this could equally be caused by a bad index file */
   if (memcmp(blk_header, "\x31\x41\x59\x26\x53\x59", 6))
     return BZSEEK_BAD_DATA;
 
@@ -133,7 +118,7 @@ static uint64_t get_bz_uncomp_pos(bzseek_file* f){
   return bzproduced + idx_uncomp_pos(f, f->curr_block);
 }
 
-static bzseek_err run_bz(bzseek_file* f, int* count, int* len, char** buf){
+static bzseek_err run_bz(bzseek_file* f, int* count, unsigned int* len, char** buf){
   f->bz.next_out = *buf;
   f->bz.avail_out = *len;
   int oldlen = *len;
@@ -254,12 +239,25 @@ static bzseek_err load_index(bzseek_file* f){
 
 
 
-bzseek_err bzseek_open(bzseek_file* file, FILE* data_file, FILE* idx_file){
-  if (!data_file){
+bzseek_err bzseek_open(bzseek_file* file, const char* data_filename, const char* idx_filename){
+  if (!data_filename){
     errno = EBADF;
     return BZSEEK_IO_ERR;
   }
-  if (!idx_file) idx_file = data_file;
+  
+  FILE* data_file = fopen(data_filename, "r");
+  if (!data_file) return BZSEEK_IO_ERR;
+
+  FILE* idx_file;
+  if (idx_filename){
+    idx_file = fopen(idx_filename, "r");
+  }else{
+    idx_file = data_file;
+  }
+  if (!idx_file) return BZSEEK_IO_ERR;
+
+
+
 
   memset(file, 0, sizeof(file));
   file->f_data = data_file;
@@ -292,7 +290,7 @@ uint64_t bzseek_len(bzseek_file* file){
 
 
 #define NULL_BUF_SZ 1024
-bzseek_err bzseek_read(bzseek_file* file, uint64_t start, int len, char* buf){
+bzseek_err bzseek_read(bzseek_file* file, uint64_t start, unsigned int len, char* buf){
   bzseek_err err = BZSEEK_OK;
 
   /* loop in case the request spans multiple blocks */
@@ -323,7 +321,8 @@ bzseek_err bzseek_read(bzseek_file* file, uint64_t start, int len, char* buf){
       int seek_forward = (int)(start - bzpos);
       while (seek_forward > 0){
         char* null_buf = devnull;
-        int null_len = seek_forward > NULL_BUF_SZ ? NULL_BUF_SZ : seek_forward;
+        unsigned int null_len = 
+          seek_forward > NULL_BUF_SZ ? NULL_BUF_SZ : seek_forward;
         int cnt;
         ATTEMPT(run_bz(file, &cnt, &null_len, &null_buf));
         seek_forward -= cnt;
@@ -364,29 +363,3 @@ const char* bzseek_errmsg(bzseek_err err){
   }
 }
 
-int main(int argc, char* argv[]){
-  //  bunzip_block(9, open("testfile.bz2", O_RDONLY), 32, 6458889 /*6458866*/);
-  //  bunzip_block(9, open("test3.bz2", O_RDONLY), atoi(argv[1]), atoi(argv[2]));
-  bzseek_file f;
-  //  f.f_data = f.f_idx = fopen("index","r");
-  //  load_index(&f);
-  bzseek_err err;
-  err = bzseek_open(&f, fopen("test4.bz2", "r"), NULL);
-  if (err){
-    printf("error opening: %s\n", bzseek_errmsg(err));
-    return 0;
-  }
-  char x[100000];
-  uint64_t start = atoi(argv[1]);
-  int len = atoi(argv[2]);
-  err = bzseek_read(&f, start, len, x);
-
-  if (err == BZSEEK_EOF){
-    len = bzseek_len(&f) - start;
-  }else if (err){
-    printf("error: %s\n" , bzseek_errmsg(err));
-  }
-  fwrite(x, 1, len, stdout);
-  bzseek_close(&f);
-  return 0;
-}
